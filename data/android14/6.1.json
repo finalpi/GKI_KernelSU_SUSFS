@@ -1,7 +1,7 @@
 {
   "android_version": "android14",
   "kernel_version": "6.1",
-  "lts": "6.1.170",
+  "lts": "6.1.174",
   "entries": [
     {
       "date": "2023-06",
@@ -122,6 +122,10 @@
     {
       "date": "2026-03",
       "kernel": "6.1.162"
+    },
+    {
+      "date": "2026-06",
+      "kernel": "6.1.172"
     }
   ]
 }
