@@ -26,6 +26,37 @@ case "$KSU_VARIANT" in
     fi
     patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
 
+    # SUSFS 2.3.0 将 6.6+ 的两个 SELinux 包装器改为必定存在的外部函数，
+    # 但仍保留函数指针判空，Clang 会以 -Wpointer-bool-conversion + -Werror 拒绝编译。
+    # 只在检测到该上游代码形态时移除无效判空；上游修复后保持幂等跳过。
+    python3 - kernel/feature/selinux_hide.c <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+replacements = {
+    """    if (security_dump_masked_av_fn)\n        security_dump_masked_av_fn(policydb, scontext, tcontext, tclass, masked, \"bounds\");\n""":
+    """    security_dump_masked_av_fn(policydb, scontext, tcontext, tclass, masked, \"bounds\");\n""",
+    """    if (context_struct_compute_av_fn) {\n        context_struct_compute_av_fn(policydb, scontext, tcontext, tclass, avd, NULL);\n    } else {\n        context_struct_compute_av(policydb, scontext, tcontext, tclass, avd, NULL);\n    }\n""":
+    """    context_struct_compute_av_fn(policydb, scontext, tcontext, tclass, avd, NULL);\n""",
+}
+
+changed = False
+for old, new in replacements.items():
+    if old in source:
+        source = source.replace(old, new, 1)
+        changed = True
+    elif new not in source:
+        raise SystemExit(f"未识别的 SELinux 包装器代码形态: {path}")
+
+if changed:
+    path.write_text(source, encoding="utf-8")
+    print("已修复 SUSFS SELinux 包装器的无效函数判空")
+else:
+    print("SUSFS SELinux 包装器已无需兼容修复")
+PY
+
     cd ..
     ;;
   "Next"|"SukiSU"|"SukiSU(40726)"|"SukiSU(40548)"|"ReSukiSU")
