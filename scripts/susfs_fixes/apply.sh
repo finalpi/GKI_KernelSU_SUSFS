@@ -148,6 +148,80 @@ fi
 
 patch -p1 < "$SUSFS_PATCH" || true
 
+# Android 15 6.6.143 在 super.c 的 include 区新增了 trace hook，导致 SUSFS 的首个 hunk
+# 因上下文变化被拒绝，而同一补丁中的功能代码仍会成功写入。精确补回该 hunk 的声明，
+# 并只在 reject 完全对应这组声明时移除已解决的 .rej。
+python3 <<'PY'
+from pathlib import Path
+
+path = Path("fs/super.c")
+source = path.read_text(encoding="utf-8")
+usage = "static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted)"
+
+if usage in source:
+    changed = False
+    include = "#include <linux/susfs_def.h>"
+    if include not in source:
+        marker = "#include <uapi/linux/mount.h>\n"
+        if marker not in source:
+            raise SystemExit(f"未找到 super.c 的 SUSFS 头文件插入位置: {path}")
+        source = source.replace(
+            marker,
+            "#ifdef CONFIG_KSU_SUSFS\n"
+            f"{include}\n"
+            "#endif // #ifdef CONFIG_KSU_SUSFS\n"
+            f"{marker}",
+            1,
+        )
+        changed = True
+
+    externs = (
+        "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+        "extern bool susfs_is_current_ksu_domain(void);\n"
+        "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n"
+        "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+    )
+    if externs not in source:
+        partial_externs = (
+            "extern bool susfs_is_current_ksu_domain(void);" in source
+            or "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;" in source
+        )
+        if partial_externs:
+            raise SystemExit(f"super.c 的 SUSFS 声明不完整: {path}")
+        marker = '#include "internal.h"\n'
+        if marker not in source:
+            raise SystemExit(f"未找到 super.c 的 SUSFS 声明插入位置: {path}")
+        source = source.replace(marker, f"{marker}\n{externs}", 1)
+        changed = True
+
+    if changed:
+        path.write_text(source, encoding="utf-8")
+        print("已补回 fs/super.c 缺失的 SUSFS 声明")
+
+    reject = Path("fs/super.c.rej")
+    if reject.exists():
+        reject_source = reject.read_text(encoding="utf-8")
+        added = [
+            line
+            for line in reject_source.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ]
+        expected = [
+            "+#ifdef CONFIG_KSU_SUSFS",
+            "+#include <linux/susfs_def.h>",
+            "+#endif // #ifdef CONFIG_KSU_SUSFS",
+            "+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT",
+            "+extern bool susfs_is_current_ksu_domain(void);",
+            "+extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;",
+            "+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT",
+            "+",
+        ]
+        hunk_count = sum(line.startswith("@@ ") for line in reject_source.splitlines())
+        if hunk_count == 1 and added == expected:
+            reject.unlink()
+            print("已清理 fs/super.c 中完成兼容处理的 SUSFS reject")
+PY
+
 # 为尚未提供 SU 会话 FD 接口的 SukiSU/ReSukiSU 恢复旧版 exec hook 行为
 EXEC_HELPER=""
 if [[ "$KSU_VARIANT" == SukiSU* || "$KSU_VARIANT" == "ReSukiSU" ]]; then
