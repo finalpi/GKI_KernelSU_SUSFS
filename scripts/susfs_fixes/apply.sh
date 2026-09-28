@@ -7,6 +7,22 @@
 # 调用前必须将工作目录设为 $KERNEL_ROOT
 set -eo pipefail
 
+# 列出当前目录下不属于上游的 .rej（相对路径，已排序）。
+# 上游分支可能自带已提交的 .rej（如 android15-6.6-2026-04 的 mm/rmap.c.rej，
+# 是上游解决合并冲突时的残留），那不是本补丁的冲突；但 patch 失败时会覆盖同名文件，
+# 所以只有「被 git 跟踪且未改动」的才视为上游自带。
+# 不在 git 仓库里（本地 verify_context.sh）时 git 命令为空，退回全部 .rej
+list_upstream_rej() {
+  git ls-files -- '*.rej' 2>/dev/null | while IFS= read -r f; do
+    git diff --quiet -- "$f" 2>/dev/null && echo "$f"
+  done
+}
+list_untracked_rej() {
+  comm -23 \
+    <(find . -type f -name '*.rej' | sed 's|^\./||' | sort) \
+    <(list_upstream_rej | sort)
+}
+
 echo "应用 SUSFS 补丁..."
 
 SUSFS_PATCH="50_add_susfs_in_gki-$ANDROID_VERSION-$KERNEL_VERSION.patch"
@@ -146,6 +162,18 @@ if [[ "$ANDROID_VERSION" == "android16" && "$KERNEL_VERSION" == "6.12" ]]; then
   fi
 fi
 
+# 新版内核在 super.c 的 internal.h 之后新增了 trace/hooks/fs.h，
+# 旧版 SUSFS 主补丁以 thaw_super_locked 为上下文插入 extern 声明，会整段被拒绝；
+# 上游 2026-09-15 起已把声明挪到 unnamed_dev_ida 之后，不再依赖这段上下文，
+# 但 ShirkNeko fork 尚未同步（固定提交的旧版补丁不改 super.c），只对旧版补丁做临时调整
+SUPER_FS_H_REMOVED=""
+if grep -q '^ static int thaw_super_locked' "$SUSFS_PATCH" \
+  && grep -qF '#include <trace/hooks/fs.h>' fs/super.c; then
+  echo "临时调整 super.c 上下文"
+  sed -i '/^#include <trace\/hooks\/fs.h>$/,+1d' fs/super.c
+  SUPER_FS_H_REMOVED=1
+fi
+
 patch -p1 < "$SUSFS_PATCH" || true
 
 # Android 15 6.6.143 在 super.c 的 include 区新增了 trace hook，导致 SUSFS 的首个 hunk
@@ -247,11 +275,24 @@ if [[ -n "$EXEC_HELPER" ]] \
   fi
 fi
 
-# 在编译前报告 SUSFS 主补丁产生的冲突文件
-SUSFS_REJ_COUNT=$(find . -name '*.rej' | wc -l)
+# 上游 5.10 补丁把 susfs_sus_kstat_spoof_vfs_statfs 的 extern 声明放在了
+# susfs_statfs_by_dentry 之后，clang -Werror 会报隐式声明；声明晚于使用时前移
+if [[ -f fs/statfs.c ]] && grep -qF 'susfs_sus_kstat_spoof_vfs_statfs(' fs/statfs.c; then
+  STATFS_USE=$(grep -n 'if (!susfs_sus_kstat_spoof_vfs_statfs(' fs/statfs.c | head -1 | cut -d: -f1)
+  STATFS_DECL=$(grep -n '^extern int susfs_sus_kstat_spoof_vfs_statfs(' fs/statfs.c | head -1 | cut -d: -f1)
+  if [[ -n "$STATFS_USE" && -n "$STATFS_DECL" && "$STATFS_DECL" -gt "$STATFS_USE" ]] \
+    && grep -q '^static int susfs_statfs_by_dentry(' fs/statfs.c; then
+    echo "前移 statfs.c 中 susfs_sus_kstat_spoof_vfs_statfs 的声明"
+    sed -i '/^static int susfs_statfs_by_dentry(/i extern int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, bool *is_fuse);' fs/statfs.c
+  fi
+fi
+
+# 在编译前报告 SUSFS 主补丁产生的冲突文件，上游自带的 .rej 不计入
+mapfile -t SUSFS_REJ_FILES < <(list_untracked_rej)
+SUSFS_REJ_COUNT=${#SUSFS_REJ_FILES[@]}
 if [ "$SUSFS_REJ_COUNT" -gt 0 ]; then
   echo "::warning title=SUSFS 补丁冲突::SUSFS 主补丁产生了 ${SUSFS_REJ_COUNT} 个 .rej 冲突文件，可能导致后续编译失败（详见 Rejects 产物）"
-  find . -name '*.rej' -print
+  printf '%s\n' "${SUSFS_REJ_FILES[@]}"
 fi
 
 # 还原仅用于补丁匹配的临时源码调整
@@ -316,6 +357,12 @@ if [[ "$ANDROID_VERSION" == "android16" && "$KERNEL_VERSION" == "6.12" ]]; then
     echo "还原 Android 16 6.12 exec.c 临时调整"
     sed -i '0,/^#include /s//#include <linux\/dma-buf.h>\n&/' fs/exec.c
   fi
+fi
+
+if [[ -n "$SUPER_FS_H_REMOVED" ]] \
+  && ! grep -qF '#include <trace/hooks/fs.h>' fs/super.c; then
+  echo "还原 super.c 临时调整"
+  sed -i '/^#include "internal.h"$/a #include <trace/hooks/fs.h>' fs/super.c
 fi
 
 fix_missing_vm_flags_clear() {
